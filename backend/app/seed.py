@@ -6,7 +6,61 @@
 """
 from __future__ import annotations
 
+from datetime import date, timedelta
 from typing import Any
+
+
+def _order_partition_inventory() -> list[dict[str, Any]]:
+    """ods_orders 订单分区台账：2025-10-01 起每日一个分区。
+
+    预置三种状态模拟历史处置痕迹，供验证幂等（已完成不重复执行）：
+    - 2026-07-20 / 2026-07-21 已转冷（上次例行清理完成，副本在冷层）
+    - 2025-10-05 已物理删除（超出 365 天合规保留期）
+    其余分区仍在热层待处置；其中 2026-07-26 已保存 120 天、
+    2025-10-19 已保存 400 天，分别命中转冷和物理删除场景。
+    """
+    today = date(2026, 11, 23)
+    pre_cold = {date(2026, 7, 20), date(2026, 7, 21)}
+    pre_deleted = {date(2025, 10, 5)}
+    rows: list[dict[str, Any]] = []
+    day = date(2025, 10, 1)
+    partition_id = 1
+    while day < today:
+        day_str = day.isoformat()
+        ordinal = day.toordinal()
+        row: dict[str, Any] = {
+            "id": partition_id,
+            "数据集": "ods_orders",
+            "分区日期": day_str,
+            "行数": 138000 + (ordinal * 7919) % 24000,
+            "大小MB": 420 + (ordinal * 31) % 90,
+            "存储层": "热层",
+            "副本位置": f"/data/hot/ods_orders/dt={day_str}",
+            "处置状态": "未处置",
+            "处置时间": "",
+            "处置作业": "",
+        }
+        if day in pre_cold:
+            row.update({
+                "存储层": "冷层",
+                "副本位置": f"s3://lake-cold/ods_orders/dt={day_str}",
+                "处置状态": "已转冷",
+                "处置时间": "2026-11-20T02:00:00Z",
+                "处置作业": "cleanup_expired_ods_partitions",
+            })
+        elif day in pre_deleted:
+            row.update({
+                "存储层": "已删除",
+                "副本位置": "",
+                "处置状态": "已删除",
+                "处置时间": "2026-11-20T02:00:00Z",
+                "处置作业": "cleanup_expired_ods_partitions",
+            })
+        rows.append(row)
+        partition_id += 1
+        day += timedelta(days=1)
+    return rows
+
 
 SEED_ROWS: dict[str, list[dict[str, Any]]] = {
     "etl_pipeline": [
@@ -153,13 +207,16 @@ SEED_ROWS: dict[str, list[dict[str, Any]]] = {
     ],
     "data_retention": [
         {"id": 1, "status": "已生效", "pending": False, "abnormal": False,
-         "规则名称": "ods_orders_90d_retention", "目标数据集": "ods_orders",
-         "保留天数": "90", "清理方式": "移至归档存储", "最近执行时间": "2026-11-20T02:00:00Z"},
-        {"id": 2, "status": "待生效", "pending": True, "abnormal": False,
-         "规则名称": "dwd_events_30d_retention", "目标数据集": "dwd_user_events",
+         "规则名称": "ods_orders_hot_tier_90d", "目标数据集": "ods_orders", "适用范围": "热层副本",
+         "保留天数": "90", "清理方式": "降冷", "最近执行时间": "2026-11-20T02:00:00Z"},
+        {"id": 2, "status": "已生效", "pending": False, "abnormal": False,
+         "规则名称": "ods_orders_compliance_365d", "目标数据集": "ods_orders", "适用范围": "全量明细",
+         "保留天数": "365", "清理方式": "仅标记过期", "最近执行时间": "2026-11-20T02:00:00Z"},
+        {"id": 3, "status": "待生效", "pending": True, "abnormal": False,
+         "规则名称": "dwd_events_30d_retention", "目标数据集": "dwd_user_events", "适用范围": "全量明细",
          "保留天数": "30", "清理方式": "降冷", "最近执行时间": ""},
-        {"id": 3, "status": "已过期", "pending": False, "abnormal": True,
-         "规则名称": "legacy_7d_force_delete", "目标数据集": "legacy_raw_logs",
+        {"id": 4, "status": "已过期", "pending": False, "abnormal": True,
+         "规则名称": "legacy_7d_force_delete", "目标数据集": "legacy_raw_logs", "适用范围": "全量明细",
          "保留天数": "7", "清理方式": "物理删除", "最近执行时间": "2026-11-14T02:00:00Z"},
     ],
     "transform_plan": [
@@ -230,8 +287,8 @@ SEED_ROWS: dict[str, list[dict[str, Any]]] = {
     ],
     "cleanup_job": [
         {"id": 1, "status": "已启用", "pending": False, "abnormal": False,
-         "作业名称": "cleanup_expired_ods_partitions", "目标路径": "/data/ods",
-         "清理条件": "分区日期早于90天", "预览行数": "4500000", "最近清理时间": "2026-11-20T03:00:00Z"},
+         "作业名称": "cleanup_expired_ods_partitions", "目标路径": "/data/hot/ods_orders",
+         "清理条件": "命中保留规则分区：超 90 天热层转冷，超 365 天物理删除", "预览行数": "4500000", "最近清理时间": "2026-11-20T03:00:00Z"},
         {"id": 2, "status": "已暂停", "pending": False, "abnormal": True,
          "作业名称": "cleanup_temp_merge_files", "目标路径": "/data/staging/_temporary",
          "清理条件": "文件超过24小时未修改", "预览行数": "0", "最近清理时间": "2026-11-15T02:00:00Z"},
@@ -253,4 +310,8 @@ SEED_ROWS: dict[str, list[dict[str, Any]]] = {
          "目标Catalog": "hms_production", "同步范围": "全部",
          "同步状态": "失败-Schema冲突2处"},
     ],
+    # 内部台账（下划线前缀，不出现在模块概览）：订单分区物理状态与处置清单，
+    # 仅供 data_retention / cleanup_job 两个领域服务共享读写。
+    "_partition_inventory": _order_partition_inventory(),
+    "_disposal_plan": [],
 }
